@@ -5,6 +5,7 @@
 
 #include "jit/api.hpp"
 #include "elastic/buffer.hpp"
+#include "kernels/token_drop.hpp"
 #include "legacy/buffer.hpp"
 
 #ifndef TORCH_EXTENSION_NAME
@@ -27,7 +28,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     // The integer type of top-k indices
     m.attr("topk_idx_t") = py::cast(c10::CppTypeToScalarType<deep_ep::topk_idx_t>::value);
-
+    m.def("_drop_tokens", &deep_ep::drop_tokens);
     // JIT API
     deep_ep::jit::register_apis(m);
 

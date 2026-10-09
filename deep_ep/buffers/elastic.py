@@ -19,6 +19,7 @@ from ..utils.envs import (
     get_nvlink_gbs, get_rdma_gbs
 )
 from ..utils.comm import get_nccl_comm_handle
+from .token_drop import TokenDropHandle
 
 
 class EPHandle:
@@ -119,6 +120,10 @@ class ElasticBuffer:
         num_nvlink_ranks: the number of physical NVLink ranks.
         runtime: the C++ runtime.
     """
+
+    supports_token_dropping: bool = all(
+        hasattr(_C.ElasticBuffer, method) for method in (
+            'dispatch_with_capacity', 'combine_with_capacity'))
 
     def __init__(self,
                  group: dist.ProcessGroup,
@@ -722,7 +727,8 @@ class ElasticBuffer:
                  do_handle_copy: bool = True,
                  do_cpu_sync: Optional[bool] = None,
                  do_expand: bool = False,
-                 use_tma_aligned_col_major_sf: bool = False) \
+                 use_tma_aligned_col_major_sf: bool = False,
+                 expert_capacity: Optional[int] = None) \
             -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                      Optional[torch.Tensor], Optional[torch.Tensor],
                      EPHandle, EventOverlap]:
@@ -762,6 +768,8 @@ class ElasticBuffer:
                 `None` defaults to `True` unless `handle` is provided.
             do_expand: whether to use the expanding layout (one slot per expert per token).
             use_tma_aligned_col_major_sf: whether to use TMA-aligned column-major layout for scale factors.
+            expert_capacity: optional per-expert route capacity. When set, routes are dropped by weight, fully dropped
+                token rows are compacted before dispatch, and combine restores the original row layout.
 
         Returns:
             recv_x: received tokens, the same type and tuple as the input `x`
@@ -771,6 +779,12 @@ class ElasticBuffer:
             event: the event after executing the kernel (valid only if `async_with_compute_stream` is set).
         """
         check_torch_deterministic()
+
+        if expert_capacity is not None:
+            assert handle is None
+            assert topk_idx is not None and topk_weights is not None
+            assert not torch.cuda.is_current_stream_capturing(), \
+                'Token dropping with row compaction does not support CUDA graphs'
 
         # Automatic decide SM and QP count
         num_topk = (handle.topk_idx if topk_idx is None else topk_idx).shape[1]
@@ -807,33 +821,49 @@ class ElasticBuffer:
         do_cpu_sync = value_or(do_cpu_sync, True)
 
         # Do dispatch
-        (recv_x, recv_sf,
-         recv_topk_idx, recv_topk_weights,
-         cloned_topk_idx,
-         num_recv_tokens_per_expert_list,
-         psum_num_recv_tokens_per_scaleup_rank,
-         psum_num_recv_tokens_per_expert,
-         recv_src_metadata,
-         dst_buffer_slot_idx,
-         token_metadata_at_forward,
-         channel_linked_list,
-         event) = self.runtime.dispatch(x, sf, topk_idx, topk_weights,
-                                        cumulative_local_expert_recv_stats,
-                                        cached_num_recv_tokens,
-                                        cached_num_recv_tokens_per_expert_list,
-                                        cached_psum_num_recv_tokens_per_scaleup_rank,
-                                        cached_psum_num_recv_tokens_per_expert,
-                                        cached_dst_buffer_slot_idx,
-                                        cached_token_metadata_at_forward,
-                                        cached_channel_linked_list,
-                                        num_max_tokens_per_rank,
-                                        num_experts, expert_alignment,
-                                        num_sms, num_qps,
-                                        previous_event,
-                                        previous_event_before_epilogue,
-                                        async_with_compute_stream, allocate_on_comm_stream,
-                                        do_handle_copy, do_cpu_sync, do_expand,
-                                        use_tma_aligned_col_major_sf)
+        dispatch_args = (x, sf, topk_idx, topk_weights,
+                         cumulative_local_expert_recv_stats,
+                         cached_num_recv_tokens,
+                         cached_num_recv_tokens_per_expert_list,
+                         cached_psum_num_recv_tokens_per_scaleup_rank,
+                         cached_psum_num_recv_tokens_per_expert,
+                         cached_dst_buffer_slot_idx,
+                         cached_token_metadata_at_forward,
+                         cached_channel_linked_list,
+                         num_max_tokens_per_rank,
+                         num_experts, expert_alignment,
+                         num_sms, num_qps,
+                         previous_event,
+                         previous_event_before_epilogue,
+                         async_with_compute_stream, allocate_on_comm_stream,
+                         do_handle_copy, do_cpu_sync, do_expand,
+                         use_tma_aligned_col_major_sf)
+        if expert_capacity is None:
+            (recv_x, recv_sf,
+             recv_topk_idx, recv_topk_weights,
+             cloned_topk_idx,
+             num_recv_tokens_per_expert_list,
+             psum_num_recv_tokens_per_scaleup_rank,
+             psum_num_recv_tokens_per_expert,
+             recv_src_metadata,
+             dst_buffer_slot_idx,
+             token_metadata_at_forward,
+             channel_linked_list,
+             event) = self.runtime.dispatch(*dispatch_args)
+            token_drop_state = None
+        else:
+            (recv_x, recv_sf,
+             recv_topk_idx, recv_topk_weights,
+             cloned_topk_idx,
+             num_recv_tokens_per_expert_list,
+             psum_num_recv_tokens_per_scaleup_rank,
+             psum_num_recv_tokens_per_expert,
+             recv_src_metadata,
+             dst_buffer_slot_idx,
+             token_metadata_at_forward,
+             channel_linked_list,
+             event, token_drop_state) = self.runtime.dispatch_with_capacity(
+                *dispatch_args, expert_capacity)
         if handle is None:
             handle = EPHandle(do_expand,
                               num_experts, expert_alignment,
@@ -847,6 +877,8 @@ class ElasticBuffer:
                               dst_buffer_slot_idx,
                               token_metadata_at_forward,
                               channel_linked_list)
+            if token_drop_state is not None:
+                handle = TokenDropHandle(handle, token_drop_state)
 
         # Repack SF
         recv_x = (recv_x, recv_sf) if recv_sf is not None else recv_x
@@ -874,7 +906,8 @@ class ElasticBuffer:
                 previous_event: EventHandle = None,
                 previous_event_before_epilogue: Optional[EventHandle] = None,
                 async_with_compute_stream: bool = False,
-                allocate_on_comm_stream: bool = False) \
+                allocate_on_comm_stream: bool = False,
+                expert_capacity: Optional[int] = None) \
             -> Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
         """
         Combine (reduce) tokens from different ranks back to their original ranks.
@@ -895,6 +928,7 @@ class ElasticBuffer:
                 finished if set.
             allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the
                 communication stream.
+            expert_capacity: optional per-expert route capacity used by dispatch. It is validated against the dispatch handle.
 
         Returns:
             combined_x: the reduced token tensor, with shape `[num_combined_tokens, hidden]` and type `torch.bfloat16`.
@@ -903,26 +937,48 @@ class ElasticBuffer:
         """
         check_torch_deterministic()
 
+        if isinstance(handle, TokenDropHandle):
+            token_drop_state = handle.state
+            assert expert_capacity is None or expert_capacity == token_drop_state.capacity
+            handle = handle.handle
+        else:
+            token_drop_state = None
+            assert expert_capacity is None
+
         # Automatic decide SM and QP count
         num_sms = handle.num_sms if num_sms == 0 else num_sms
         num_qps = self.get_theoretical_num_qps(num_sms) if num_qps == 0 else num_qps
         assert num_qps <= self.num_allocated_qps, f'Allocated QPs are not enough'
 
         bias_0, bias_1 = ElasticBuffer._unpack_bias(bias)
-        combined_x, combined_topk_weights, event = \
-            self.runtime.combine(x, topk_weights,
-                                 bias_0, bias_1,
-                                 handle.recv_src_metadata,
-                                 handle.topk_idx,
-                                 handle.psum_num_recv_tokens_per_scaleup_rank,
-                                 handle.token_metadata_at_forward,
-                                 handle.channel_linked_list,
-                                 handle.num_experts,
-                                 handle.num_max_tokens_per_rank,
-                                 num_sms, num_qps,
-                                 previous_event,
-                                 previous_event_before_epilogue,
-                                 async_with_compute_stream,
-                                 allocate_on_comm_stream,
-                                 handle.do_expand)
+        if token_drop_state is None:
+            combined_x, combined_topk_weights, event = \
+                self.runtime.combine(x, topk_weights,
+                                     bias_0, bias_1,
+                                     handle.recv_src_metadata,
+                                     handle.topk_idx,
+                                     handle.psum_num_recv_tokens_per_scaleup_rank,
+                                     handle.token_metadata_at_forward,
+                                     handle.channel_linked_list,
+                                     handle.num_experts,
+                                     handle.num_max_tokens_per_rank,
+                                     num_sms, num_qps,
+                                     previous_event,
+                                     previous_event_before_epilogue,
+                                     async_with_compute_stream,
+                                     allocate_on_comm_stream,
+                                     handle.do_expand)
+        else:
+            combined_x, combined_topk_weights, event = \
+                self.runtime.combine_with_capacity(
+                    x, topk_weights, bias_0, bias_1,
+                    handle.recv_src_metadata,
+                    handle.psum_num_recv_tokens_per_scaleup_rank,
+                    handle.token_metadata_at_forward,
+                    handle.channel_linked_list,
+                    handle.num_experts, handle.num_max_tokens_per_rank,
+                    num_sms, num_qps, previous_event,
+                    previous_event_before_epilogue,
+                    async_with_compute_stream, allocate_on_comm_stream,
+                    handle.do_expand, token_drop_state)
         return combined_x, combined_topk_weights, EventOverlap(event)

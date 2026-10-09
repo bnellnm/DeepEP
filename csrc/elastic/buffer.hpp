@@ -10,6 +10,7 @@
 
 #include "../kernels/backend/api.cuh"
 #include "../kernels/elastic/api.hpp"
+#include "../kernels/token_drop.hpp"
 #include "../utils/event.hpp"
 #include "utils.hpp"
 
@@ -493,9 +494,9 @@ public:
         return {std::move(out), std::move(handle)};
     }
 
-    torch::cuda::CUDAStream stream_control_prologue(const std::optional<EventHandle>& previous_event,
-                                                    const bool& allocate_on_comm_stream,
-                                                    const bool& async_with_compute_stream) const {
+    at::cuda::CUDAStream stream_control_prologue(const std::optional<EventHandle>& previous_event,
+                                                 const bool& allocate_on_comm_stream,
+                                                 const bool& async_with_compute_stream) const {
         // Allocate all tensors on communication stream if set
         // NOTES: do not allocate tensors upfront!
         const auto compute_stream = at::cuda::getCurrentCUDAStream();
@@ -1139,6 +1140,63 @@ public:
                 event};
     }
 
+    auto dispatch_with_capacity(
+        const torch::Tensor& x,
+        const std::optional<torch::Tensor>& sf,
+        const torch::Tensor& topk_idx,
+        const torch::Tensor& topk_weights,
+        const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+        const std::optional<int>& cached_num_recv_tokens,
+        const std::optional<std::vector<int>>& cached_num_recv_tokens_per_expert_list,
+        const std::optional<torch::Tensor>& cached_psum_num_recv_tokens_per_scaleup_rank,
+        const std::optional<torch::Tensor>& cached_psum_num_recv_tokens_per_expert,
+        const std::optional<torch::Tensor>& cached_dst_buffer_slot_idx,
+        const std::optional<torch::Tensor>& cached_token_metadata_at_forward,
+        const std::optional<torch::Tensor>& cached_channel_linked_list,
+        const int& num_max_tokens_per_rank,
+        const int& num_experts,
+        const int& expert_alignment,
+        const int& num_sms,
+        const int& num_qps,
+        const std::optional<EventHandle>& previous_event,
+        const std::optional<EventHandle>& previous_event_before_epilogue,
+        const bool& async_with_compute_stream,
+        const bool& allocate_on_comm_stream,
+        const bool& do_handle_copy,
+        const bool& do_cpu_sync,
+        const bool& do_expand,
+        const bool& use_tma_aligned_col_major_sf,
+        int expert_capacity) const {
+        EP_HOST_ASSERT(!cached_num_recv_tokens.has_value());
+        auto state = make_token_drop_state(x, sf, topk_idx, topk_weights, expert_capacity);
+        auto result = dispatch(state->x,
+                               state->x_scales,
+                               state->topk_idx,
+                               state->topk_weights,
+                               cumulative_local_expert_recv_stats,
+                               cached_num_recv_tokens,
+                               cached_num_recv_tokens_per_expert_list,
+                               cached_psum_num_recv_tokens_per_scaleup_rank,
+                               cached_psum_num_recv_tokens_per_expert,
+                               cached_dst_buffer_slot_idx,
+                               cached_token_metadata_at_forward,
+                               cached_channel_linked_list,
+                               num_max_tokens_per_rank,
+                               num_experts,
+                               expert_alignment,
+                               num_sms,
+                               num_qps,
+                               previous_event,
+                               previous_event_before_epilogue,
+                               async_with_compute_stream,
+                               allocate_on_comm_stream,
+                               do_handle_copy,
+                               do_cpu_sync,
+                               do_expand,
+                               use_tma_aligned_col_major_sf);
+        return std::tuple_cat(std::move(result), std::make_tuple(state));
+    }
+
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>>
     combine(const torch::Tensor& x,
             const std::optional<torch::Tensor>& topk_weights,
@@ -1302,6 +1360,70 @@ public:
             allocate_on_comm_stream, async_with_compute_stream);
         return {combined_x, combined_topk_weights, event};
     }
+
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>>
+    combine_with_capacity(const torch::Tensor& x,
+                          const std::optional<torch::Tensor>& topk_weights,
+                          const std::optional<torch::Tensor>& bias_0,
+                          const std::optional<torch::Tensor>& bias_1,
+                          const torch::Tensor& src_metadata,
+                          const torch::Tensor& psum_num_recv_tokens_per_scaleup_rank,
+                          const std::optional<torch::Tensor>& token_metadata_at_forward,
+                          const std::optional<torch::Tensor>& channel_linked_list,
+                          const int& num_experts,
+                          const int& num_max_tokens_per_rank,
+                          const int& num_sms,
+                          const int& num_qps,
+                          const std::optional<EventHandle>& previous_event,
+                          const std::optional<EventHandle>& previous_event_before_epilogue,
+                          const bool& async_with_compute_stream,
+                          const bool& allocate_on_comm_stream,
+                          const bool& use_expanded_layout,
+                          const std::shared_ptr<TokenDropState>& state) const {
+        EP_HOST_ASSERT(state != nullptr);
+        const auto compute_stream = at::cuda::getCurrentCUDAStream();
+        auto [compact_x, compact_topk_weights, compact_event] = combine(
+            x,
+            topk_weights,
+            compact_token_drop_rows(bias_0, *state),
+            compact_token_drop_rows(bias_1, *state),
+            src_metadata,
+            state->topk_idx,
+            psum_num_recv_tokens_per_scaleup_rank,
+            token_metadata_at_forward,
+            channel_linked_list,
+            num_experts,
+            num_max_tokens_per_rank,
+            num_sms,
+            num_qps,
+            previous_event,
+            previous_event_before_epilogue,
+            true,
+            allocate_on_comm_stream,
+            use_expanded_layout);
+        at::cuda::setCurrentCUDAStream(comm_stream);
+        auto combined_x = scatter_token_drop_rows(compact_x, *state);
+        auto combined_topk_weights = compact_topk_weights.has_value()
+                                         ? std::optional<torch::Tensor>(scatter_token_drop_rows(compact_topk_weights.value(), *state))
+                                         : std::nullopt;
+        std::optional<EventHandle> event;
+        if (async_with_compute_stream) {
+            state->retained_rows.record_stream(comm_stream);
+            combined_x.record_stream(comm_stream);
+            combined_topk_weights.has_value() ? combined_topk_weights->record_stream(comm_stream) : void();
+            event = EventHandle(comm_stream);
+            if (compact_event.has_value())
+                event->tensors_to_record = std::move(compact_event->tensors_to_record);
+            event->tensors_to_record.insert(event->tensors_to_record.end(),
+                                            {state->retained_rows, state->topk_idx, state->topk_weights, compact_x, combined_x});
+            if (combined_topk_weights.has_value())
+                event->tensors_to_record.emplace_back(combined_topk_weights);
+        } else {
+            stream_wait(compute_stream, comm_stream);
+        }
+        at::cuda::setCurrentCUDAStream(compute_stream);
+        return {combined_x, combined_topk_weights, event};
+    }
 };
 
 static void register_apis(pybind11::module_& m) {
@@ -1323,7 +1445,9 @@ static void register_apis(pybind11::module_& m) {
         .def("agrs_get_inplace_tensor", &ElasticBuffer::agrs_get_inplace_tensor)
         .def("all_gather", &ElasticBuffer::all_gather)
         .def("dispatch", &ElasticBuffer::dispatch)
-        .def("combine", &ElasticBuffer::combine);
+        .def("dispatch_with_capacity", &ElasticBuffer::dispatch_with_capacity)
+        .def("combine", &ElasticBuffer::combine)
+        .def("combine_with_capacity", &ElasticBuffer::combine_with_capacity);
     m.def("create_cpu_handle", &ElasticBuffer::create_cpu_handle);
     m.def("calculate_elastic_buffer_size", &ElasticBuffer::calculate_buffer_size);
     m.def("get_elastic_buffer_alignment", [=]() {

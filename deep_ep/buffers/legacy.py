@@ -9,6 +9,7 @@ import deep_ep._C as _C
 from deep_ep._C import Config, EventHandle
 from ..utils.event import EventOverlap
 from ..utils.envs import check_nvlink_connections, check_torch_deterministic
+from .token_drop import TokenDropHandle
 
 
 class Buffer:
@@ -29,6 +30,16 @@ class Buffer:
     """
 
     num_sms: int = 20
+    supports_token_dropping: bool = all(
+        hasattr(_C.Buffer, method) for method in (
+            'intranode_dispatch_with_capacity',
+            'intranode_combine_with_capacity',
+            'internode_dispatch_with_capacity',
+            'internode_combine_with_capacity',
+            'low_latency_dispatch_with_capacity',
+            'low_latency_combine_with_capacity',
+        )
+    )
 
     def __init__(self,
                  group: Optional[dist.ProcessGroup],
@@ -327,7 +338,8 @@ class Buffer:
                  expert_alignment: int = 1, num_worst_tokens: int = 0,
                  config: Optional[Config] = None,
                  previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
-                 allocate_on_comm_stream: bool = False) -> \
+                 allocate_on_comm_stream: bool = False,
+                 expert_capacity: Optional[int] = None) -> \
             Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], Optional[torch.Tensor],
             Optional[torch.Tensor], List[int], Tuple, EventOverlap]:
         """
@@ -357,6 +369,8 @@ class Buffer:
             previous_event: the event to wait before actually executing the kernel.
             async_finish: the current stream will not wait for the communication kernels to be finished if set.
             allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the communication stream.
+            expert_capacity: optional per-expert route capacity. When set, routes are dropped by weight, fully dropped
+                token rows are compacted before dispatch, and combine restores the original row layout.
 
         Returns:
             recv_x: received tokens, the same type and tuple as the input `x`, but the number of tokens equals to the
@@ -373,6 +387,48 @@ class Buffer:
 
         # Default config
         config = self.get_dispatch_config(self.group_size) if config is None else config
+
+        if expert_capacity is not None:
+            assert handle is None
+            assert topk_idx is not None and topk_weights is not None
+            assert num_tokens_per_expert is not None
+            assert not torch.cuda.is_current_stream_capturing(), \
+                'Token dropping with row compaction does not support CUDA graphs'
+            x, x_scales = x if isinstance(x, tuple) else (x, None)
+            num_experts = num_tokens_per_expert.numel()
+            if self.runtime.get_num_rdma_ranks() > 1:
+                (recv_x, recv_x_scales,
+                 recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list,
+                 rdma_channel_prefix_matrix, gbl_channel_prefix_matrix,
+                 recv_rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum,
+                 recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum,
+                 recv_src_meta, send_rdma_head, send_nvl_head, event,
+                 is_token_in_rank, token_drop_state) = self.runtime.internode_dispatch_with_capacity(
+                    x, x_scales, topk_idx, topk_weights, num_experts, expert_capacity,
+                    expert_alignment, config, getattr(previous_event, 'event', None),
+                    async_finish, allocate_on_comm_stream)
+                handle = (is_token_in_rank, rdma_channel_prefix_matrix,
+                          gbl_channel_prefix_matrix, recv_rdma_channel_prefix_matrix,
+                          recv_rdma_rank_prefix_sum, recv_gbl_channel_prefix_matrix,
+                          recv_gbl_rank_prefix_sum, recv_src_meta, send_rdma_head,
+                          send_nvl_head)
+            else:
+                (recv_x, recv_x_scales,
+                 recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list,
+                 rank_prefix_matrix, channel_prefix_matrix,
+                 recv_channel_prefix_matrix, recv_src_idx, send_head, event,
+                 is_token_in_rank, token_drop_state) = self.runtime.intranode_dispatch_with_capacity(
+                    x, x_scales, topk_idx, topk_weights, num_experts, expert_capacity,
+                    expert_alignment, num_worst_tokens, config,
+                    getattr(previous_event, 'event', None), async_finish,
+                    allocate_on_comm_stream)
+                handle = (rank_prefix_matrix, channel_prefix_matrix,
+                          recv_channel_prefix_matrix, recv_src_idx,
+                          is_token_in_rank, send_head)
+            return ((recv_x, recv_x_scales) if x_scales is not None else recv_x,
+                    recv_topk_idx, recv_topk_weights,
+                    num_recv_tokens_per_expert_list,
+                    TokenDropHandle(handle, token_drop_state), EventOverlap(event))
 
         # Internode
         if self.runtime.get_num_rdma_ranks() > 1:
@@ -410,7 +466,8 @@ class Buffer:
                 bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
                 config: Optional[Config] = None,
                 previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
-                allocate_on_comm_stream: bool = False) -> \
+                allocate_on_comm_stream: bool = False,
+                expert_capacity: Optional[int] = None) -> \
             Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
         """
         Combine (reduce) tokens (addition **without** weights) from different ranks, both intranode and internode
@@ -428,6 +485,7 @@ class Buffer:
             previous_event: the event to wait before actually executing the kernel.
             async_finish: the current stream will not wait for the communication kernels to be finished if set.
             allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the communication stream.
+            expert_capacity: optional per-expert route capacity used by dispatch. It is validated against the dispatch handle.
 
         Returns:
             recv_x: the reduced token from its dispatched ranks.
@@ -439,9 +497,43 @@ class Buffer:
         # Default config
         config = self.get_combine_config(self.group_size) if config is None else config
 
+        if isinstance(handle, TokenDropHandle):
+            token_drop_state = handle.state
+            assert expert_capacity is None or expert_capacity == token_drop_state.capacity
+            handle = handle.handle
+            if self.runtime.get_num_rdma_ranks() > 1:
+                (is_combined_token_in_rank,
+                 _, _,
+                 rdma_channel_prefix_matrix, rdma_rank_prefix_sum,
+                 gbl_channel_prefix_matrix, gbl_rank_prefix_sum,
+                 src_meta, send_rdma_head, send_nvl_head) = handle
+                bias_0, bias_1 = Buffer._unpack_bias(bias)
+                combined_x, combined_topk_weights, event = \
+                    self.runtime.internode_combine_with_capacity(
+                        x, topk_weights, bias_0, bias_1, src_meta,
+                        is_combined_token_in_rank, rdma_channel_prefix_matrix,
+                        rdma_rank_prefix_sum, gbl_channel_prefix_matrix,
+                        send_rdma_head, send_nvl_head, config,
+                        getattr(previous_event, 'event', None), async_finish,
+                        allocate_on_comm_stream, token_drop_state)
+            else:
+                rank_prefix_matrix, _, channel_prefix_matrix, src_idx, _, send_head = handle
+                bias_0, bias_1 = Buffer._unpack_bias(bias)
+                combined_x, combined_topk_weights, event = \
+                    self.runtime.intranode_combine_with_capacity(
+                        x, topk_weights, bias_0, bias_1, src_idx,
+                        rank_prefix_matrix, channel_prefix_matrix, send_head, config,
+                        getattr(previous_event, 'event', None), async_finish,
+                        allocate_on_comm_stream, token_drop_state)
+            return combined_x, combined_topk_weights, EventOverlap(event)
+        else:
+            assert expert_capacity is None
+
         # Internode
         if self.runtime.get_num_rdma_ranks() > 1:
-            return self.internode_combine(x, handle, topk_weights, bias, config, previous_event, async_finish, allocate_on_comm_stream)
+            return self.internode_combine(x, handle, topk_weights, bias, config,
+                                         previous_event, async_finish,
+                                         allocate_on_comm_stream)
 
         # NOTES: the second `_` is for the sending side, so we should use the third one
         rank_prefix_matrix, _, channel_prefix_matrix, src_idx, is_recv_token_in_rank, send_head = handle
@@ -555,7 +647,9 @@ class Buffer:
                              cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                              dispatch_wait_recv_cost_stats: Optional[torch.Tensor] = None,
                              use_fp8: bool = True, round_scale: bool = False, use_ue8m0: bool = False,
-                             async_finish: bool = False, return_recv_hook: bool = False) -> \
+                             async_finish: bool = False, return_recv_hook: bool = False,
+                             expert_capacity: Optional[int] = None,
+                             topk_weights: Optional[torch.Tensor] = None) -> \
             Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
         """
         A low-latency implementation for dispatching with IBGDA.
@@ -584,6 +678,9 @@ class Buffer:
             return_recv_hook: return a receiving hook if set. If set, the kernel will just do the RDMA request issues,
                 but **without actually receiving the data**. You must call the received hook to make sure the data's arrival.
                 If you do not set this flag, the kernel will ensure the data's arrival.
+            expert_capacity: optional per-expert route capacity. Requires `topk_weights` and restores the original
+                token layout during `low_latency_combine`.
+            topk_weights: `[num_tokens, num_topk]` routing weights required when `expert_capacity` is set.
 
         Returns:
             recv_x: a tensor or tuple with received tokens for each expert.
@@ -606,6 +703,28 @@ class Buffer:
         """
         check_torch_deterministic()
 
+        if expert_capacity is not None:
+            assert topk_weights is not None
+            assert not torch.cuda.is_current_stream_capturing(), \
+                'Token dropping with row compaction does not support CUDA graphs'
+            assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
+            (packed_recv_x, packed_recv_x_scales, packed_recv_count,
+             packed_recv_src_info, packed_recv_layout_range, event, hook,
+             token_drop_state) = self.runtime.low_latency_dispatch_with_capacity(
+                x, topk_idx, topk_weights, cumulative_local_expert_recv_stats,
+                dispatch_wait_recv_cost_stats, num_max_dispatch_tokens_per_rank,
+                num_experts, expert_capacity, use_fp8, round_scale, use_ue8m0,
+                async_finish, return_recv_hook)
+            handle = (packed_recv_src_info, packed_recv_layout_range,
+                      num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
+            tensors_to_record = (packed_recv_x, packed_recv_x_scales,
+                                 packed_recv_count, packed_recv_src_info,
+                                 packed_recv_layout_range,
+                                 cumulative_local_expert_recv_stats)
+            return ((packed_recv_x, packed_recv_x_scales) if use_fp8 else packed_recv_x,
+                    packed_recv_count, TokenDropHandle(handle, token_drop_state),
+                    EventOverlap(event, tensors_to_record if async_finish else None), hook)
+
         assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
         packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
             self.runtime.low_latency_dispatch(x, topk_idx,
@@ -624,7 +743,8 @@ class Buffer:
     def low_latency_combine(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
                             handle: tuple, use_logfmt: bool = False, zero_copy: bool = False, async_finish: bool = False,
                             return_recv_hook: bool = False, out: Optional[torch.Tensor] = None,
-                            combine_wait_recv_cost_stats: Optional[torch.Tensor] = None) -> \
+                            combine_wait_recv_cost_stats: Optional[torch.Tensor] = None,
+                            expert_capacity: Optional[int] = None) -> \
             Tuple[torch.Tensor, EventOverlap, Callable]:
         """
         A low-latency implementation for combining tokens (reduce **with weights**) with IBGDA.
@@ -653,6 +773,7 @@ class Buffer:
             combine_wait_recv_cost_stats: a cumulative time spent waiting to receive each token tensor for statistics,
                 which should have shape `[num_ranks, num_ranks]` and be typed as `torch.int64`.
                 This is useful for detecting and precisely localizing slow anomalies.
+            expert_capacity: optional per-expert route capacity used by dispatch. It is validated against the dispatch handle.
 
         Returns:
             combined_x: the reduced token tensor, with shape `[num_combined_tokens, hidden]` and type `torch.bfloat16`.
@@ -660,6 +781,21 @@ class Buffer:
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
         check_torch_deterministic()
+
+        if isinstance(handle, TokenDropHandle):
+            token_drop_state = handle.state
+            assert expert_capacity is None or expert_capacity == token_drop_state.capacity
+            handle = handle.handle
+            src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
+            assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
+            combined_x, event, hook = self.runtime.low_latency_combine_with_capacity(
+                x, src_info, layout_range, combine_wait_recv_cost_stats,
+                num_max_dispatch_tokens_per_rank, num_experts, use_logfmt,
+                zero_copy, async_finish, return_recv_hook, out, token_drop_state)
+            tensors_to_record = (x, src_info, layout_range, combined_x)
+            return combined_x, EventOverlap(event, tensors_to_record if async_finish else None), hook
+        else:
+            assert expert_capacity is None
 
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
@@ -709,5 +845,7 @@ class Buffer:
                 `[num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden]`, you should fill this buffer
                 by yourself.
         """
+        if isinstance(handle, TokenDropHandle):
+            handle = handle.handle
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         return self.runtime.get_next_low_latency_combine_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)

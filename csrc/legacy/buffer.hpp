@@ -13,6 +13,7 @@
 
 #include "../utils/event.hpp"
 #include "../utils/shared_memory.hpp"
+#include "../kernels/token_drop.hpp"
 #include "../kernels/legacy/api.cuh"
 #include "../kernels/backend/api.cuh"
 #include "config.hpp"
@@ -1428,6 +1429,189 @@ public:
         return {combined_x, combined_topk_weights, event};
     }
 
+    auto intranode_dispatch_with_capacity(const torch::Tensor& x,
+                                          const std::optional<torch::Tensor>& x_scales,
+                                          const torch::Tensor& topk_idx,
+                                          const torch::Tensor& topk_weights,
+                                          int num_experts,
+                                          int expert_capacity,
+                                          int expert_alignment,
+                                          int num_worst_tokens,
+                                          const Config& config,
+                                          std::optional<EventHandle> previous_event,
+                                          bool async,
+                                          bool allocate_on_comm_stream) {
+        auto state = make_token_drop_state(x, x_scales, topk_idx, topk_weights, expert_capacity);
+        auto [num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, layout_event] =
+            get_dispatch_layout(state->topk_idx, num_experts, previous_event, false, false);
+        auto result = intranode_dispatch(state->x,
+                                         state->x_scales,
+                                         state->topk_idx,
+                                         state->topk_weights,
+                                         num_tokens_per_rank,
+                                         is_token_in_rank,
+                                         num_tokens_per_expert,
+                                         0,
+                                         std::nullopt,
+                                         std::nullopt,
+                                         expert_alignment,
+                                         num_worst_tokens,
+                                         config,
+                                         previous_event,
+                                         async,
+                                         allocate_on_comm_stream);
+        return std::tuple_cat(std::move(result), std::make_tuple(is_token_in_rank, state));
+    }
+
+    auto internode_dispatch_with_capacity(const torch::Tensor& x,
+                                          const std::optional<torch::Tensor>& x_scales,
+                                          const torch::Tensor& topk_idx,
+                                          const torch::Tensor& topk_weights,
+                                          int num_experts,
+                                          int expert_capacity,
+                                          int expert_alignment,
+                                          const Config& config,
+                                          std::optional<EventHandle> previous_event,
+                                          bool async,
+                                          bool allocate_on_comm_stream) {
+        auto state = make_token_drop_state(x, x_scales, topk_idx, topk_weights, expert_capacity);
+        auto [num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, layout_event] =
+            get_dispatch_layout(state->topk_idx, num_experts, previous_event, false, false);
+        auto result = internode_dispatch(state->x,
+                                         state->x_scales,
+                                         state->topk_idx,
+                                         state->topk_weights,
+                                         num_tokens_per_rank,
+                                         num_tokens_per_rdma_rank,
+                                         is_token_in_rank,
+                                         num_tokens_per_expert,
+                                         0,
+                                         0,
+                                         std::nullopt,
+                                         std::nullopt,
+                                         std::nullopt,
+                                         std::nullopt,
+                                         expert_alignment,
+                                         0,
+                                         config,
+                                         previous_event,
+                                         async,
+                                         allocate_on_comm_stream);
+        return std::tuple_cat(std::move(result), std::make_tuple(is_token_in_rank, state));
+    }
+
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>>
+    intranode_combine_with_capacity(const torch::Tensor& x,
+                                    const std::optional<torch::Tensor>& topk_weights,
+                                    const std::optional<torch::Tensor>& bias_0,
+                                    const std::optional<torch::Tensor>& bias_1,
+                                    const torch::Tensor& src_idx,
+                                    const torch::Tensor& rank_prefix_matrix,
+                                    const torch::Tensor& channel_prefix_matrix,
+                                    const torch::Tensor& send_head,
+                                    const Config& config,
+                                    std::optional<EventHandle> previous_event,
+                                    bool async,
+                                    bool allocate_on_comm_stream,
+                                    const std::shared_ptr<TokenDropState>& state) {
+        EP_HOST_ASSERT(state != nullptr);
+        const auto compute_stream = at::cuda::getCurrentCUDAStream();
+        auto [compact_x, compact_topk_weights, compact_event] = intranode_combine(
+            x,
+            topk_weights,
+            compact_token_drop_rows(bias_0, *state),
+            compact_token_drop_rows(bias_1, *state),
+            src_idx,
+            rank_prefix_matrix,
+            channel_prefix_matrix,
+            send_head,
+            config,
+            previous_event,
+            true,
+            allocate_on_comm_stream);
+        at::cuda::setCurrentCUDAStream(comm_stream);
+        auto combined_x = scatter_token_drop_rows(compact_x, *state);
+        auto combined_topk_weights = compact_topk_weights.has_value()
+                                         ? std::optional<torch::Tensor>(scatter_token_drop_rows(compact_topk_weights.value(), *state))
+                                         : std::nullopt;
+        std::optional<EventHandle> event;
+        if (async) {
+            state->retained_rows.record_stream(comm_stream);
+            combined_x.record_stream(comm_stream);
+            combined_topk_weights.has_value() ? combined_topk_weights->record_stream(comm_stream) : void();
+            event = EventHandle(comm_stream);
+            if (compact_event.has_value())
+                event->tensors_to_record = std::move(compact_event->tensors_to_record);
+            event->tensors_to_record.insert(event->tensors_to_record.end(),
+                                            {state->retained_rows, state->topk_idx, state->topk_weights, compact_x, combined_x});
+            if (combined_topk_weights.has_value())
+                event->tensors_to_record.emplace_back(combined_topk_weights);
+        } else {
+            stream_wait(compute_stream, comm_stream);
+        }
+        at::cuda::setCurrentCUDAStream(compute_stream);
+        return {combined_x, combined_topk_weights, event};
+    }
+
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>>
+    internode_combine_with_capacity(const torch::Tensor& x,
+                                    const std::optional<torch::Tensor>& topk_weights,
+                                    const std::optional<torch::Tensor>& bias_0,
+                                    const std::optional<torch::Tensor>& bias_1,
+                                    const torch::Tensor& src_meta,
+                                    const torch::Tensor& is_combined_token_in_rank,
+                                    const torch::Tensor& rdma_channel_prefix_matrix,
+                                    const torch::Tensor& rdma_rank_prefix_sum,
+                                    const torch::Tensor& gbl_channel_prefix_matrix,
+                                    const torch::Tensor& send_rdma_head,
+                                    const torch::Tensor& send_nvl_head,
+                                    const Config& config,
+                                    std::optional<EventHandle> previous_event,
+                                    bool async,
+                                    bool allocate_on_comm_stream,
+                                    const std::shared_ptr<TokenDropState>& state) {
+        EP_HOST_ASSERT(state != nullptr);
+        const auto compute_stream = at::cuda::getCurrentCUDAStream();
+        auto [compact_x, compact_topk_weights, compact_event] = internode_combine(
+            x,
+            topk_weights,
+            compact_token_drop_rows(bias_0, *state),
+            compact_token_drop_rows(bias_1, *state),
+            src_meta,
+            is_combined_token_in_rank,
+            rdma_channel_prefix_matrix,
+            rdma_rank_prefix_sum,
+            gbl_channel_prefix_matrix,
+            send_rdma_head,
+            send_nvl_head,
+            config,
+            previous_event,
+            true,
+            allocate_on_comm_stream);
+        at::cuda::setCurrentCUDAStream(comm_stream);
+        auto combined_x = scatter_token_drop_rows(compact_x, *state);
+        auto combined_topk_weights = compact_topk_weights.has_value()
+                                         ? std::optional<torch::Tensor>(scatter_token_drop_rows(compact_topk_weights.value(), *state))
+                                         : std::nullopt;
+        std::optional<EventHandle> event;
+        if (async) {
+            state->retained_rows.record_stream(comm_stream);
+            combined_x.record_stream(comm_stream);
+            combined_topk_weights.has_value() ? combined_topk_weights->record_stream(comm_stream) : void();
+            event = EventHandle(comm_stream);
+            if (compact_event.has_value())
+                event->tensors_to_record = std::move(compact_event->tensors_to_record);
+            event->tensors_to_record.insert(event->tensors_to_record.end(),
+                                            {state->retained_rows, state->topk_idx, state->topk_weights, compact_x, combined_x});
+            if (combined_topk_weights.has_value())
+                event->tensors_to_record.emplace_back(combined_topk_weights);
+        } else {
+            stream_wait(compute_stream, comm_stream);
+        }
+        at::cuda::setCurrentCUDAStream(compute_stream);
+        return {combined_x, combined_topk_weights, event};
+    }
+
     void clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) {
         EP_HOST_ASSERT(low_latency_mode);
 
@@ -1714,6 +1898,111 @@ public:
         return {combined_x, event, recv_hook};
     }
 
+    auto low_latency_dispatch_with_capacity(const torch::Tensor& x,
+                                            const torch::Tensor& topk_idx,
+                                            const torch::Tensor& topk_weights,
+                                            const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+                                            const std::optional<torch::Tensor>& dispatch_wait_recv_cost_stats,
+                                            int num_max_dispatch_tokens_per_rank,
+                                            int num_experts,
+                                            int expert_capacity,
+                                            bool use_fp8,
+                                            bool round_scale,
+                                            bool use_ue8m0,
+                                            bool async,
+                                            bool return_recv_hook) {
+        auto state = make_token_drop_state(x, std::nullopt, topk_idx, topk_weights, expert_capacity);
+        auto result = low_latency_dispatch(state->x,
+                                           state->topk_idx,
+                                           cumulative_local_expert_recv_stats,
+                                           dispatch_wait_recv_cost_stats,
+                                           num_max_dispatch_tokens_per_rank,
+                                           num_experts,
+                                           use_fp8,
+                                           round_scale,
+                                           use_ue8m0,
+                                           async,
+                                           return_recv_hook);
+        return std::tuple_cat(std::move(result), std::make_tuple(state));
+    }
+
+    std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
+    low_latency_combine_with_capacity(const torch::Tensor& x,
+                                      const torch::Tensor& src_info,
+                                      const torch::Tensor& layout_range,
+                                      const std::optional<torch::Tensor>& combine_wait_recv_cost_stats,
+                                      int num_max_dispatch_tokens_per_rank,
+                                      int num_experts,
+                                      bool use_logfmt,
+                                      bool zero_copy,
+                                      bool async,
+                                      bool return_recv_hook,
+                                      const std::optional<torch::Tensor>& out,
+                                      const std::shared_ptr<TokenDropState>& state) {
+        EP_HOST_ASSERT(state != nullptr);
+        EP_HOST_ASSERT(not(async and return_recv_hook));
+        auto compact_out = std::optional<torch::Tensor>();
+        if (out.has_value()) {
+            EP_HOST_ASSERT(out->dim() == 2 and out->is_contiguous());
+            EP_HOST_ASSERT(out->size(0) == state->original_num_tokens);
+            compact_out = torch::empty({state->num_retained_tokens, out->size(1)}, out->options());
+        }
+
+        if (return_recv_hook) {
+            auto [compact_x, compact_event, compact_hook] = low_latency_combine(x,
+                                                                                  state->topk_idx,
+                                                                                  state->topk_weights,
+                                                                                  src_info,
+                                                                                  layout_range,
+                                                                                  combine_wait_recv_cost_stats,
+                                                                                  num_max_dispatch_tokens_per_rank,
+                                                                                  num_experts,
+                                                                                  use_logfmt,
+                                                                                  zero_copy,
+                                                                                  false,
+                                                                                  true,
+                                                                                  compact_out);
+            EP_HOST_ASSERT(compact_hook.has_value());
+            auto output = out.value_or(torch::empty({state->original_num_tokens, compact_x.size(1)}, compact_x.options()));
+            auto hook = [compact_x, compact_hook, output, state]() {
+                compact_hook.value()();
+                scatter_token_drop_rows(compact_x, *state, output);
+            };
+            return {output, std::nullopt, hook};
+        }
+
+        const auto compute_stream = at::cuda::getCurrentCUDAStream();
+        auto [compact_x, compact_event, compact_hook] = low_latency_combine(x,
+                                                                              state->topk_idx,
+                                                                              state->topk_weights,
+                                                                              src_info,
+                                                                              layout_range,
+                                                                              combine_wait_recv_cost_stats,
+                                                                              num_max_dispatch_tokens_per_rank,
+                                                                              num_experts,
+                                                                              use_logfmt,
+                                                                              zero_copy,
+                                                                              true,
+                                                                              false,
+                                                                              compact_out);
+        at::cuda::setCurrentCUDAStream(comm_stream);
+        auto output = scatter_token_drop_rows(compact_x, *state, out);
+        std::optional<EventHandle> event;
+        if (async) {
+            state->retained_rows.record_stream(comm_stream);
+            output.record_stream(comm_stream);
+            event = EventHandle(comm_stream);
+            if (compact_event.has_value())
+                event->tensors_to_record = std::move(compact_event->tensors_to_record);
+            event->tensors_to_record.insert(event->tensors_to_record.end(),
+                                            {state->retained_rows, state->topk_idx, state->topk_weights, compact_x, output});
+        } else {
+            stream_wait(compute_stream, comm_stream);
+        }
+        at::cuda::setCurrentCUDAStream(compute_stream);
+        return {output, event, std::nullopt};
+    }
+
     torch::Tensor get_next_low_latency_combine_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) const {
         LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
 
@@ -1764,6 +2053,9 @@ static void register_apis(pybind11::module_& m) {
         .def(pybind11::init<>())
         .def("current_stream_wait", &EventHandle::current_stream_wait);
 
+    pybind11::class_<TokenDropState, std::shared_ptr<TokenDropState>>(m, "TokenDropState")
+        .def_property_readonly("capacity", [](const TokenDropState& state) { return state.capacity; });
+
     pybind11::class_<Buffer>(m, "Buffer")
         .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool>())
         .def("is_available", &Buffer::is_available)
@@ -1779,12 +2071,18 @@ static void register_apis(pybind11::module_& m) {
         .def("destroy", &Buffer::destroy)
         .def("get_dispatch_layout", &Buffer::get_dispatch_layout)
         .def("intranode_dispatch", &Buffer::intranode_dispatch)
+        .def("intranode_dispatch_with_capacity", &Buffer::intranode_dispatch_with_capacity)
         .def("intranode_combine", &Buffer::intranode_combine)
+        .def("intranode_combine_with_capacity", &Buffer::intranode_combine_with_capacity)
         .def("internode_dispatch", &Buffer::internode_dispatch)
+        .def("internode_dispatch_with_capacity", &Buffer::internode_dispatch_with_capacity)
         .def("internode_combine", &Buffer::internode_combine)
+        .def("internode_combine_with_capacity", &Buffer::internode_combine_with_capacity)
         .def("clean_low_latency_buffer", &Buffer::clean_low_latency_buffer)
         .def("low_latency_dispatch", &Buffer::low_latency_dispatch)
+        .def("low_latency_dispatch_with_capacity", &Buffer::low_latency_dispatch_with_capacity)
         .def("low_latency_combine", &Buffer::low_latency_combine)
+        .def("low_latency_combine_with_capacity", &Buffer::low_latency_combine_with_capacity)
         .def("low_latency_update_mask_buffer", &Buffer::low_latency_update_mask_buffer)
         .def("low_latency_query_mask_buffer", &Buffer::low_latency_query_mask_buffer)
         .def("low_latency_clean_mask_buffer", &Buffer::low_latency_clean_mask_buffer)

@@ -45,7 +45,7 @@ link_directories(${TORCH_INSTALL_PREFIX}/lib ${CUDA_TOOLKIT_ROOT_DIR}/lib ${NVSH
 add_subdirectory(csrc)
 
 # Link CPP and CUDA together
-pybind11_add_module(_C csrc/python_api.cpp)
+pybind11_add_module(_C csrc/python_api.cpp csrc/kernels/token_drop.cu)
 target_link_libraries(_C PRIVATE nccl ${RUNTIME_CUDA_LIBRARIES} ${LEGACY_CUDA_LIBRARIES} ${TORCH_LIBRARIES} torch_python)
 
 # Enable kernel code indexing with CMake-based IDEs
