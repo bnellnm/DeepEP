@@ -679,7 +679,8 @@ class Buffer:
                 but **without actually receiving the data**. You must call the received hook to make sure the data's arrival.
                 If you do not set this flag, the kernel will ensure the data's arrival.
             expert_capacity: optional per-expert route capacity. Requires `topk_weights` and restores the original
-                token layout during `low_latency_combine`.
+                token layout during `low_latency_combine`. When set, the expert-row dimension is
+                `num_ranks * packed_tokens_per_rank`, where `packed_tokens_per_rank` is the aligned capacity.
             topk_weights: `[num_tokens, num_topk]` routing weights required when `expert_capacity` is set.
 
         Returns:
@@ -705,8 +706,6 @@ class Buffer:
 
         if expert_capacity is not None:
             assert topk_weights is not None
-            assert not torch.cuda.is_current_stream_capturing(), \
-                'Token dropping with row compaction does not support CUDA graphs'
             assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
             (packed_recv_x, packed_recv_x_scales, packed_recv_count,
              packed_recv_src_info, packed_recv_layout_range, event, hook,
@@ -732,7 +731,8 @@ class Buffer:
                                               dispatch_wait_recv_cost_stats,
                                               num_max_dispatch_tokens_per_rank, num_experts,
                                               use_fp8, round_scale, use_ue8m0,
-                                              async_finish, return_recv_hook)
+                                              async_finish, return_recv_hook,
+                                              num_max_dispatch_tokens_per_rank)
         handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
         tensors_to_record = (x, topk_idx, packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info,
                              packed_recv_layout_range, cumulative_local_expert_recv_stats)
@@ -755,7 +755,8 @@ class Buffer:
 
         Arguments:
             x: `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden]` with `torch.bfloat16`,
-                the local calculated tokens to be sent to this original rank and reduced.
+                the local calculated tokens to be sent to this original rank and reduced. With capacity enabled,
+                the row dimension uses the aligned capacity recorded in `handle` instead.
             topk_idx: `[num_combined_tokens, num_topk]` with `deep_ep.topk_idx_t` (typically `torch.int64`), the expert
                 indices selected by the dispatched tokens. `-1` indices (not selecting any expert) are supported. Note that,
                 `num_combined_tokens` equals to the number of dispatched tokens.
@@ -801,6 +802,7 @@ class Buffer:
         assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
         combined_x, event, hook = self.runtime.low_latency_combine(x, topk_idx, topk_weights, src_info, layout_range,
                                                                    combine_wait_recv_cost_stats, num_max_dispatch_tokens_per_rank,
+                                                                   num_max_dispatch_tokens_per_rank,
                                                                    num_experts, use_logfmt, zero_copy, async_finish, return_recv_hook, out)
         tensors_to_record = (x, topk_idx, topk_weights, src_info, layout_range, combined_x)
         return combined_x, EventOverlap(event, tensors_to_record if async_finish else None), hook
@@ -842,10 +844,17 @@ class Buffer:
 
         Returns:
             buffer: the raw RDMA low-latency buffer as a BF16 PyTorch tensor with shape
-                `[num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden]`, you should fill this buffer
-                by yourself.
+                `[num_local_experts, num_ranks * packed_tokens_per_rank, hidden]`, where `packed_tokens_per_rank`
+                is the aligned capacity when token dropping is enabled and otherwise equals
+                `num_max_dispatch_tokens_per_rank`. You should fill this buffer by yourself.
         """
+        packed_tokens_per_rank = None
         if isinstance(handle, TokenDropHandle):
+            packed_tokens_per_rank = handle.state.packed_tokens_per_rank
             handle = handle.handle
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
-        return self.runtime.get_next_low_latency_combine_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
+        return self.runtime.get_next_low_latency_combine_buffer(
+            num_max_dispatch_tokens_per_rank,
+            packed_tokens_per_rank or num_max_dispatch_tokens_per_rank,
+            hidden,
+            num_experts)

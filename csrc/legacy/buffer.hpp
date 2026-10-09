@@ -1654,8 +1654,11 @@ public:
                          bool round_scale,
                          bool use_ue8m0,
                          bool async,
-                         bool return_recv_hook) {
+                         bool return_recv_hook,
+                         int num_max_packed_tokens_per_rank) {
         EP_HOST_ASSERT(low_latency_mode);
+        EP_HOST_ASSERT(num_max_packed_tokens_per_rank > 0);
+        EP_HOST_ASSERT(num_max_packed_tokens_per_rank <= num_max_dispatch_tokens_per_rank);
 
         // Tensor checks
         // By default using `ptp128c` FP8 cast
@@ -1697,27 +1700,28 @@ public:
             stream_wait(launch_stream, compute_stream);
 
         // Allocate packed tensors
-        auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
+        auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_packed_tokens_per_rank, hidden},
                                           x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16));
         auto packed_recv_src_info =
-            torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+            torch::empty({num_local_experts, num_ranks * num_max_packed_tokens_per_rank}, torch::dtype(torch::kInt32).device(torch::kCUDA));
         auto packed_recv_layout_range = torch::empty({num_local_experts, num_ranks}, torch::dtype(torch::kInt64).device(torch::kCUDA));
         auto packed_recv_count = torch::empty({num_local_experts}, torch::dtype(torch::kInt32).device(torch::kCUDA));
 
         // Allocate column-majored scales
         auto packed_recv_x_scales = std::optional<torch::Tensor>();
         void* packed_recv_x_scales_ptr = nullptr;
-        EP_HOST_ASSERT((num_ranks * num_max_dispatch_tokens_per_rank) % 4 == 0 and "TMA requires the number of tokens to be multiple of 4");
+        EP_HOST_ASSERT((num_ranks * num_max_packed_tokens_per_rank) % 4 == 0 and
+                       "TMA requires the number of packed tokens to be multiple of 4");
 
         if (use_fp8) {
             // TODO: support unaligned cases
             EP_HOST_ASSERT(hidden % 512 == 0);
             if (not use_ue8m0) {
-                packed_recv_x_scales = torch::empty({num_local_experts, hidden / 128, num_ranks * num_max_dispatch_tokens_per_rank},
+                packed_recv_x_scales = torch::empty({num_local_experts, hidden / 128, num_ranks * num_max_packed_tokens_per_rank},
                                                     torch::dtype(torch::kFloat32).device(torch::kCUDA));
             } else {
                 EP_HOST_ASSERT(round_scale);
-                packed_recv_x_scales = torch::empty({num_local_experts, hidden / 512, num_ranks * num_max_dispatch_tokens_per_rank},
+                packed_recv_x_scales = torch::empty({num_local_experts, hidden / 512, num_ranks * num_max_packed_tokens_per_rank},
                                                     torch::dtype(torch::kInt).device(torch::kCUDA));
             }
             packed_recv_x_scales = torch::transpose(packed_recv_x_scales.value(), 1, 2);
@@ -1746,6 +1750,7 @@ public:
                 num_tokens,
                 hidden,
                 num_max_dispatch_tokens_per_rank,
+                num_max_packed_tokens_per_rank,
                 num_topk,
                 num_experts,
                 rank,
@@ -1787,6 +1792,7 @@ public:
         const torch::Tensor& layout_range,
         const std::optional<torch::Tensor>& combine_wait_recv_cost_stats,
         int num_max_dispatch_tokens_per_rank,
+        int num_max_packed_tokens_per_rank,
         int num_experts,
         bool use_logfmt,
         bool zero_copy,
@@ -1798,7 +1804,7 @@ public:
         // Tensor checks
         EP_HOST_ASSERT(x.dim() == 3 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
         EP_HOST_ASSERT(x.size(0) == num_experts / num_ranks);
-        EP_HOST_ASSERT(x.size(1) == num_ranks * num_max_dispatch_tokens_per_rank);
+        EP_HOST_ASSERT(x.size(1) == num_ranks * num_max_packed_tokens_per_rank);
         EP_HOST_ASSERT(x.size(2) % sizeof(int4) == 0 and x.size(2) % 128 == 0);
         EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
         EP_HOST_ASSERT(topk_idx.size(0) == topk_weights.size(0) and topk_idx.size(1) == topk_weights.size(1));
@@ -1808,6 +1814,7 @@ public:
         EP_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
         EP_HOST_ASSERT(src_info.dim() == 2 and src_info.is_contiguous());
         EP_HOST_ASSERT(src_info.scalar_type() == torch::kInt32 and x.size(0) == src_info.size(0));
+        EP_HOST_ASSERT(src_info.size(1) == num_ranks * num_max_packed_tokens_per_rank);
         EP_HOST_ASSERT(layout_range.dim() == 2 and layout_range.is_contiguous());
         EP_HOST_ASSERT(layout_range.scalar_type() == torch::kInt64);
         EP_HOST_ASSERT(layout_range.size(0) == num_experts / num_ranks and layout_range.size(1) == num_ranks);
@@ -1866,6 +1873,7 @@ public:
                                   num_combined_tokens,
                                   hidden,
                                   num_max_dispatch_tokens_per_rank,
+                                  num_max_packed_tokens_per_rank,
                                   num_topk,
                                   num_experts,
                                   rank,
@@ -1911,7 +1919,11 @@ public:
                                             bool use_ue8m0,
                                             bool async,
                                             bool return_recv_hook) {
-        auto state = make_token_drop_state(x, std::nullopt, topk_idx, topk_weights, expert_capacity);
+        auto state = make_low_latency_token_drop_state(
+            x, topk_idx, topk_weights, expert_capacity, num_max_dispatch_tokens_per_rank);
+        while ((num_ranks * state->packed_tokens_per_rank) % 4 != 0)
+            ++state->packed_tokens_per_rank;
+        EP_HOST_ASSERT(state->packed_tokens_per_rank <= num_max_dispatch_tokens_per_rank);
         auto result = low_latency_dispatch(state->x,
                                            state->topk_idx,
                                            cumulative_local_expert_recv_stats,
@@ -1922,7 +1934,8 @@ public:
                                            round_scale,
                                            use_ue8m0,
                                            async,
-                                           return_recv_hook);
+                                           return_recv_hook,
+                                           state->packed_tokens_per_rank);
         return std::tuple_cat(std::move(result), std::make_tuple(state));
     }
 
@@ -1940,70 +1953,31 @@ public:
                                       const std::optional<torch::Tensor>& out,
                                       const std::shared_ptr<TokenDropState>& state) {
         EP_HOST_ASSERT(state != nullptr);
-        EP_HOST_ASSERT(not(async and return_recv_hook));
-        auto compact_out = std::optional<torch::Tensor>();
-        if (out.has_value()) {
-            EP_HOST_ASSERT(out->dim() == 2 and out->is_contiguous());
-            EP_HOST_ASSERT(out->size(0) == state->original_num_tokens);
-            compact_out = torch::empty({state->num_retained_tokens, out->size(1)}, out->options());
-        }
-
-        if (return_recv_hook) {
-            auto [compact_x, compact_event, compact_hook] = low_latency_combine(x,
-                                                                                  state->topk_idx,
-                                                                                  state->topk_weights,
-                                                                                  src_info,
-                                                                                  layout_range,
-                                                                                  combine_wait_recv_cost_stats,
-                                                                                  num_max_dispatch_tokens_per_rank,
-                                                                                  num_experts,
-                                                                                  use_logfmt,
-                                                                                  zero_copy,
-                                                                                  false,
-                                                                                  true,
-                                                                                  compact_out);
-            EP_HOST_ASSERT(compact_hook.has_value());
-            auto output = out.value_or(torch::empty({state->original_num_tokens, compact_x.size(1)}, compact_x.options()));
-            auto hook = [compact_x, compact_hook, output, state]() {
-                compact_hook.value()();
-                scatter_token_drop_rows(compact_x, *state, output);
-            };
-            return {output, std::nullopt, hook};
-        }
-
-        const auto compute_stream = at::cuda::getCurrentCUDAStream();
-        auto [compact_x, compact_event, compact_hook] = low_latency_combine(x,
-                                                                              state->topk_idx,
-                                                                              state->topk_weights,
-                                                                              src_info,
-                                                                              layout_range,
-                                                                              combine_wait_recv_cost_stats,
-                                                                              num_max_dispatch_tokens_per_rank,
-                                                                              num_experts,
-                                                                              use_logfmt,
-                                                                              zero_copy,
-                                                                              true,
-                                                                              false,
-                                                                              compact_out);
-        at::cuda::setCurrentCUDAStream(comm_stream);
-        auto output = scatter_token_drop_rows(compact_x, *state, out);
-        std::optional<EventHandle> event;
-        if (async) {
-            state->retained_rows.record_stream(comm_stream);
-            output.record_stream(comm_stream);
-            event = EventHandle(comm_stream);
-            if (compact_event.has_value())
-                event->tensors_to_record = std::move(compact_event->tensors_to_record);
-            event->tensors_to_record.insert(event->tensors_to_record.end(),
-                                            {state->retained_rows, state->topk_idx, state->topk_weights, compact_x, output});
-        } else {
-            stream_wait(compute_stream, comm_stream);
-        }
-        at::cuda::setCurrentCUDAStream(compute_stream);
-        return {output, event, std::nullopt};
+        auto result = low_latency_combine(x,
+                                          state->topk_idx,
+                                          state->topk_weights,
+                                          src_info,
+                                          layout_range,
+                                          combine_wait_recv_cost_stats,
+                                          num_max_dispatch_tokens_per_rank,
+                                          state->packed_tokens_per_rank,
+                                          num_experts,
+                                          use_logfmt,
+                                          zero_copy,
+                                          async,
+                                          return_recv_hook,
+                                          out);
+        auto& event = std::get<1>(result);
+        if (event.has_value())
+            event->tensors_to_record.insert(
+                event->tensors_to_record.end(), {state->topk_idx, state->topk_weights});
+        return result;
     }
 
-    torch::Tensor get_next_low_latency_combine_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) const {
+    torch::Tensor get_next_low_latency_combine_buffer(int num_max_dispatch_tokens_per_rank,
+                                                      int num_max_packed_tokens_per_rank,
+                                                      int hidden,
+                                                      int num_experts) const {
         LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
 
         auto buffer = layout.buffers[low_latency_buffer_idx];
@@ -2012,8 +1986,8 @@ public:
 
         EP_HOST_ASSERT(buffer.num_bytes_per_combine_msg % elementSize(torch::kBFloat16) == 0);
         return torch::from_blob(buffer.combine_rdma_send_buffer_data_start,
-                                {num_experts / num_ranks, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
-                                {num_ranks * num_max_dispatch_tokens_per_rank * num_msg_elems, num_msg_elems, 1},
+                                {num_experts / num_ranks, num_ranks * num_max_packed_tokens_per_rank, hidden},
+                                {num_ranks * num_max_packed_tokens_per_rank * num_msg_elems, num_msg_elems, 1},
                                 torch::TensorOptions().dtype(dtype).device(torch::kCUDA));
     }
 
@@ -2054,7 +2028,8 @@ static void register_apis(pybind11::module_& m) {
         .def("current_stream_wait", &EventHandle::current_stream_wait);
 
     pybind11::class_<TokenDropState, std::shared_ptr<TokenDropState>>(m, "TokenDropState")
-        .def_property_readonly("capacity", [](const TokenDropState& state) { return state.capacity; });
+        .def_property_readonly("capacity", [](const TokenDropState& state) { return state.capacity; })
+        .def_property_readonly("packed_tokens_per_rank", [](const TokenDropState& state) { return state.packed_tokens_per_rank; });
 
     pybind11::class_<Buffer>(m, "Buffer")
         .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool>())

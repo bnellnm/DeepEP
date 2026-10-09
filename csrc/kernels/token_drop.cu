@@ -15,12 +15,19 @@ namespace deep_ep {
 namespace {
 
 constexpr int kNumThreads = 256;
+constexpr int kPairwiseMaxTopK = 8;
+constexpr int kPairwiseMaxAssignments = 16 * 1024;
 
 struct TokenDropSelection {
     torch::Tensor topk_idx;
     torch::Tensor topk_weights;
     torch::Tensor retained_rows;
     int num_retained_rows;
+};
+
+struct TokenDropAssignments {
+    torch::Tensor topk_idx;
+    torch::Tensor topk_weights;
 };
 
 __global__ void initialize_indices_kernel(int* indices, int num_assignments) {
@@ -33,6 +40,64 @@ __global__ void gather_expert_keys_kernel(const topk_idx_t* topk_idx, const int*
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < num_assignments)
         expert_keys[idx] = topk_idx[indices[idx]];
+}
+
+__global__ __launch_bounds__(kNumThreads) void select_assignments_pairwise_kernel(const topk_idx_t* topk_idx,
+                                                                                  const float* topk_weights,
+                                                                                  topk_idx_t* output_topk_idx,
+                                                                                  float* output_topk_weights,
+                                                                                  int num_topk,
+                                                                                  int num_assignments,
+                                                                                  int expert_capacity) {
+    __shared__ topk_idx_t tile_experts[kNumThreads];
+    __shared__ float tile_weights[kNumThreads];
+
+    const int token_idx = static_cast<int>(blockIdx.x);
+    const int warp_idx = static_cast<int>(threadIdx.x) / warpSize;
+    const int lane_idx = static_cast<int>(threadIdx.x) % warpSize;
+    const int assignment_idx = token_idx * num_topk + warp_idx;
+    const bool active = warp_idx < num_topk;
+    const auto expert_idx = active ? __ldg(topk_idx + assignment_idx) : static_cast<topk_idx_t>(-1);
+    const auto weight = active ? __ldg(topk_weights + assignment_idx) : 0.0f;
+
+    if (expert_capacity == 0) {
+        if (active and lane_idx == 0) {
+            output_topk_idx[assignment_idx] = -1;
+            output_topk_weights[assignment_idx] = 0.0f;
+        }
+        return;
+    }
+
+    int rank = 0;
+    for (int tile_begin = 0; tile_begin < num_assignments; tile_begin += kNumThreads) {
+        const int other_idx = tile_begin + static_cast<int>(threadIdx.x);
+        if (other_idx < num_assignments) {
+            tile_experts[threadIdx.x] = __ldg(topk_idx + other_idx);
+            tile_weights[threadIdx.x] = __ldg(topk_weights + other_idx);
+        }
+        __syncthreads();
+
+        const int tile_size = min(kNumThreads, num_assignments - tile_begin);
+        if (active and expert_idx >= 0) {
+            for (int tile_idx = lane_idx; tile_idx < tile_size; tile_idx += warpSize) {
+                const int candidate_idx = tile_begin + tile_idx;
+                const float candidate_weight = tile_weights[tile_idx];
+                rank += tile_experts[tile_idx] == expert_idx and
+                    (candidate_weight > weight or (candidate_weight == weight and candidate_idx < assignment_idx));
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int offset = warpSize / 2; offset > 0; offset /= 2)
+        rank += __shfl_down_sync(0xffffffff, rank, offset);
+
+    if (active and lane_idx == 0) {
+        const bool keep = expert_idx >= 0 and rank < expert_capacity;
+        output_topk_idx[assignment_idx] = keep ? expert_idx : -1;
+        output_topk_weights[assignment_idx] = keep ? weight : 0.0f;
+    }
 }
 
 __global__ void finalize_assignments_kernel(const topk_idx_t* topk_idx,
@@ -102,7 +167,7 @@ __global__ void scatter_rows_kernel(
     }
 }
 
-TokenDropSelection select_token_drop_routes(const torch::Tensor& topk_idx, const torch::Tensor& topk_weights, int expert_capacity) {
+TokenDropAssignments select_token_drop_assignments(const torch::Tensor& topk_idx, const torch::Tensor& topk_weights, int expert_capacity) {
     EP_HOST_ASSERT(expert_capacity >= 0);
     EP_HOST_ASSERT(topk_idx.is_cuda() && topk_idx.is_contiguous());
     EP_HOST_ASSERT(topk_weights.is_cuda() && topk_weights.is_contiguous());
@@ -119,14 +184,25 @@ TokenDropSelection select_token_drop_routes(const torch::Tensor& topk_idx, const
     const int num_topk = static_cast<int>(topk_idx.size(1));
     auto output_topk_idx = torch::empty_like(topk_idx);
     auto output_topk_weights = torch::empty_like(topk_weights);
-    auto retained_rows = torch::empty({0}, topk_idx.options().dtype(torch::kInt));
 
     if (num_tokens == 0 || num_topk == 0)
-        return {output_topk_idx, output_topk_weights, retained_rows, 0};
+        return {output_topk_idx, output_topk_weights};
 
     const int num_assignments = num_tokens * num_topk;
     const auto stream = at::cuda::getCurrentCUDAStream(topk_idx.get_device());
     const int num_blocks = (num_assignments + kNumThreads - 1) / kNumThreads;
+
+    if (num_topk <= kPairwiseMaxTopK and num_assignments <= kPairwiseMaxAssignments) {
+        select_assignments_pairwise_kernel<<<num_tokens, kNumThreads, 0, stream>>>(topk_idx.data_ptr<topk_idx_t>(),
+                                                                                   topk_weights.data_ptr<float>(),
+                                                                                   output_topk_idx.data_ptr<topk_idx_t>(),
+                                                                                   output_topk_weights.data_ptr<float>(),
+                                                                                   num_topk,
+                                                                                   num_assignments,
+                                                                                   expert_capacity);
+        CUDA_RUNTIME_CHECK(cudaGetLastError());
+        return {output_topk_idx, output_topk_weights};
+    }
 
     auto sorted_weights = torch::empty_like(topk_weights).view({num_assignments});
     auto expert_keys_in = torch::empty_like(topk_idx).view({num_assignments});
@@ -218,9 +294,22 @@ TokenDropSelection select_token_drop_routes(const torch::Tensor& topk_idx, const
                                                                         expert_capacity);
     CUDA_RUNTIME_CHECK(cudaGetLastError());
 
+    return {output_topk_idx, output_topk_weights};
+}
+
+TokenDropSelection select_token_drop_routes(const torch::Tensor& topk_idx, const torch::Tensor& topk_weights, int expert_capacity) {
+    auto assignments = select_token_drop_assignments(topk_idx, topk_weights, expert_capacity);
+    const int num_tokens = static_cast<int>(topk_idx.size(0));
+    const int num_topk = static_cast<int>(topk_idx.size(1));
+    auto retained_rows = torch::empty({0}, topk_idx.options().dtype(torch::kInt));
+    if (num_tokens == 0 || num_topk == 0)
+        return {assignments.topk_idx, assignments.topk_weights, retained_rows, 0};
+
+    const auto stream = at::cuda::getCurrentCUDAStream(topk_idx.get_device());
+
     auto retained_flags = torch::empty({num_tokens}, topk_idx.options().dtype(torch::kBool));
     mark_dropped_rows_kernel<<<num_tokens, kNumThreads, 0, stream>>>(
-        output_topk_idx.data_ptr<topk_idx_t>(), retained_flags.data_ptr<bool>(), num_tokens, num_topk);
+        assignments.topk_idx.data_ptr<topk_idx_t>(), retained_flags.data_ptr<bool>(), num_tokens, num_topk);
     CUDA_RUNTIME_CHECK(cudaGetLastError());
     retained_flags.logical_not_();
 
@@ -251,7 +340,7 @@ TokenDropSelection select_token_drop_routes(const torch::Tensor& topk_idx, const
         &num_retained_rows, retained_count_device.data_ptr<int>(), sizeof(num_retained_rows), cudaMemcpyDeviceToHost, stream));
     CUDA_RUNTIME_CHECK(cudaStreamSynchronize(stream));
     retained_rows = retained_rows_full.narrow(0, 0, num_retained_rows);
-    return {output_topk_idx, output_topk_weights, retained_rows, num_retained_rows};
+    return {assignments.topk_idx, assignments.topk_weights, retained_rows, num_retained_rows};
 }
 
 }  // namespace
@@ -328,6 +417,29 @@ std::shared_ptr<TokenDropState> make_token_drop_state(const torch::Tensor& x,
     state->x = compact_token_drop_rows(x, *state);
     state->x_scales =
         x_scales.has_value() ? std::optional<torch::Tensor>(compact_token_drop_rows(x_scales->contiguous(), *state)) : std::nullopt;
+    return state;
+}
+
+std::shared_ptr<TokenDropState> make_low_latency_token_drop_state(const torch::Tensor& x,
+                                                                  const torch::Tensor& topk_idx,
+                                                                  const torch::Tensor& topk_weights,
+                                                                  int expert_capacity,
+                                                                  int num_max_dispatch_tokens_per_rank) {
+    EP_HOST_ASSERT(x.is_cuda() && x.is_contiguous());
+    EP_HOST_ASSERT(x.dim() == 2 && x.size(0) == topk_idx.size(0));
+    EP_HOST_ASSERT(x.size(0) <= num_max_dispatch_tokens_per_rank);
+    auto assignments = select_token_drop_assignments(topk_idx, topk_weights, expert_capacity);
+    auto state = std::make_shared<TokenDropState>(TokenDropState{
+        expert_capacity,
+        x.size(0),
+        static_cast<int>(x.size(0)),
+        torch::empty({0}, topk_idx.options().dtype(torch::kInt)),
+        assignments.topk_idx,
+        assignments.topk_weights,
+        x,
+        std::nullopt,
+    });
+    state->packed_tokens_per_rank = std::max(1, std::min(expert_capacity, num_max_dispatch_tokens_per_rank));
     return state;
 }
 

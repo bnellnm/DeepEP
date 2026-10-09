@@ -17,6 +17,7 @@ struct TokenDropState {
     torch::Tensor topk_weights;
     torch::Tensor x;
     std::optional<torch::Tensor> x_scales;
+    int packed_tokens_per_rank = 0;
 };
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> drop_tokens(const torch::Tensor& topk_idx,
@@ -28,6 +29,12 @@ std::shared_ptr<TokenDropState> make_token_drop_state(const torch::Tensor& x,
                                                       const torch::Tensor& topk_idx,
                                                       const torch::Tensor& topk_weights,
                                                       int expert_capacity);
+
+std::shared_ptr<TokenDropState> make_low_latency_token_drop_state(const torch::Tensor& x,
+                                                                  const torch::Tensor& topk_idx,
+                                                                  const torch::Tensor& topk_weights,
+                                                                  int expert_capacity,
+                                                                  int num_max_dispatch_tokens_per_rank);
 
 torch::Tensor compact_token_drop_rows(const torch::Tensor& input, const TokenDropState& state);
 

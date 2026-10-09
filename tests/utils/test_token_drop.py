@@ -144,7 +144,8 @@ class _LegacyRuntime:
                                            *args):
         self.capacity_dispatch_inputs.append((x, topk_idx, topk_weights, args[4]))
         return (x[1:2], None, torch.tensor([1]), object(), object(), None,
-                None, SimpleNamespace(capacity=args[4]))
+                None, SimpleNamespace(capacity=args[4],
+                                      packed_tokens_per_rank=args[4]))
 
     def low_latency_combine(self, x, topk_idx, topk_weights, *args):
         return x, None, None
@@ -152,6 +153,10 @@ class _LegacyRuntime:
     def low_latency_combine_with_capacity(self, x, *args):
         self.capacity_combine_calls += 1
         return torch.tensor([[0, 0], [2, 3], [0, 0]], dtype=x.dtype), None, None
+
+    def get_next_low_latency_combine_buffer(self, *args):
+        self.next_low_latency_combine_buffer_args = args
+        return args
 
 
 def _legacy_buffer(runtime: _LegacyRuntime) -> Buffer:
@@ -229,6 +234,9 @@ def test_low_latency_capacity_uses_native_dispatch_and_combine(monkeypatch):
     torch.testing.assert_close(
         combined, torch.tensor([[0, 0], [2, 3], [0, 0]], dtype=x.dtype))
     assert runtime.capacity_combine_calls == 1
+
+    raw_buffer = buffer.get_next_low_latency_combine_buffer(handle)
+    assert raw_buffer == (3, 1, 2, 1)
 
 
 class _ElasticRuntime:

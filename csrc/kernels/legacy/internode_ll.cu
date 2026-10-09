@@ -145,6 +145,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                                                     int num_next_clean_int,
                                                     int num_tokens,
                                                     int num_max_dispatch_tokens_per_rank,
+                                                    int num_max_packed_tokens_per_rank,
                                                     int num_topk,
                                                     int num_experts,
                                                     int rank,
@@ -366,12 +367,12 @@ LOW_LATENCY_DISPATCH_RECV:
             local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
             src_rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg;
         const auto recv_x_int4 =
-            static_cast<int4*>(packed_recv_x) + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * hidden_int4;
-        const auto recv_src_info = packed_recv_src_info + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank;
+            static_cast<int4*>(packed_recv_x) + local_expert_idx * num_ranks * num_max_packed_tokens_per_rank * hidden_int4;
+        const auto recv_src_info = packed_recv_src_info + local_expert_idx * num_ranks * num_max_packed_tokens_per_rank;
         const auto recv_range = packed_recv_layout_range + local_expert_idx * num_ranks;
         const auto num_aligned_scales = align_up<int>(num_scales, sizeof(float) / sizeof(scale_t));
         const auto recv_x_scales = static_cast<scale_t*>(packed_recv_x_scales) +
-            local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_aligned_scales;
+            local_expert_idx * num_ranks * num_max_packed_tokens_per_rank * num_aligned_scales;
 
         // Shared between sub-warps in warp groups
         __shared__ int shared_num_recv_tokens[kNumMaxWarpGroups], shared_recv_token_begin_idx[kNumMaxWarpGroups];
@@ -406,6 +407,7 @@ LOW_LATENCY_DISPATCH_RECV:
 
             num_recv_tokens = -num_recv_tokens - 1;
             recv_token_begin_idx = atomicAdd(packed_recv_count + local_expert_idx, num_recv_tokens);
+            EP_DEVICE_ASSERT(recv_token_begin_idx + num_recv_tokens <= num_ranks * num_max_packed_tokens_per_rank);
             shared_num_recv_tokens[warp_group_id] = num_recv_tokens;
             shared_recv_token_begin_idx[warp_group_id] = recv_token_begin_idx;
             recv_range[src_rank] = pack2<int, int64_t>(num_recv_tokens, recv_token_begin_idx);
@@ -443,7 +445,7 @@ LOW_LATENCY_DISPATCH_RECV:
                 const auto num_elems_per_pack = static_cast<int>(sizeof(packed_t) / sizeof(scale_t));
                 const auto token_idx = recv_token_begin_idx + i;
                 const auto token_stride = num_elems_per_pack;
-                const auto pack_stride = num_ranks * num_max_dispatch_tokens_per_rank * num_elems_per_pack;
+                const auto pack_stride = num_ranks * num_max_packed_tokens_per_rank * num_elems_per_pack;
                 if (lane_id < num_scales) {
                     const auto pack_idx = lane_id / num_elems_per_pack;
                     const auto elem_idx = lane_id % num_elems_per_pack;
@@ -479,6 +481,7 @@ void dispatch(void* packed_recv_x,
               int num_tokens,
               int hidden,
               int num_max_dispatch_tokens_per_rank,
+              int num_max_packed_tokens_per_rank,
               int num_topk,
               int num_experts,
               int rank,
@@ -537,6 +540,7 @@ void dispatch(void* packed_recv_x,
                       num_next_clean_int,                    \
                       num_tokens,                            \
                       num_max_dispatch_tokens_per_rank,      \
+                      num_max_packed_tokens_per_rank,        \
                       num_topk,                              \
                       num_experts,                           \
                       rank,                                  \
@@ -730,6 +734,7 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
                                                    int hidden,
                                                    int num_topk,
                                                    int num_max_dispatch_tokens_per_rank,
+                                                   int num_max_packed_tokens_per_rank,
                                                    int num_experts,
                                                    int rank,
                                                    int num_ranks,
@@ -792,10 +797,10 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
         const auto global_expert_idx = rank * num_local_experts + local_expert_idx;
         const auto layout = __ldg(layout_range + local_expert_idx * num_ranks + dst_rank);
         const auto local_x =
-            static_cast<const int4*>(x) + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * hidden_bf16_int4;
-        const auto local_src_info = src_info + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank;
+            static_cast<const int4*>(x) + local_expert_idx * num_ranks * num_max_packed_tokens_per_rank * hidden_bf16_int4;
+        const auto local_src_info = src_info + local_expert_idx * num_ranks * num_max_packed_tokens_per_rank;
         const auto rdma_send_x_vec =
-            static_cast<uint8_t*>(rdma_send_x) + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_slot;
+            static_cast<uint8_t*>(rdma_send_x) + local_expert_idx * num_ranks * num_max_packed_tokens_per_rank * num_bytes_per_slot;
 
         // Unpack layout
         int offset, num_tokens_to_send;
@@ -1153,6 +1158,7 @@ void combine(void* combined_x,
              int num_combined_tokens,
              int hidden,
              int num_max_dispatch_tokens_per_rank,
+             int num_max_packed_tokens_per_rank,
              int num_topk,
              int num_experts,
              int rank,
@@ -1222,6 +1228,7 @@ void combine(void* combined_x,
                       hidden,                                                                                                      \
                       num_topk,                                                                                                    \
                       num_max_dispatch_tokens_per_rank,                                                                            \
+                      num_max_packed_tokens_per_rank,                                                                              \
                       num_experts,                                                                                                 \
                       rank,                                                                                                        \
                       num_ranks,                                                                                                   \
