@@ -8,7 +8,7 @@ import deep_ep
 import deep_ep._C as _C
 from deep_ep.buffers.elastic import ElasticBuffer
 from deep_ep.buffers.legacy import Buffer
-from deep_ep.buffers.token_drop import TokenDropHandle
+from deep_ep.buffers.token_drop import TokenDropHandle, TokenDropStats
 
 
 def _reference(
@@ -38,6 +38,30 @@ def _reference(
         topk_weights.masked_fill(discard, 0),
         discard.all(dim=1),
     )
+
+
+def test_token_drop_handle_exposes_statistics():
+    state = SimpleNamespace(
+        original_topk_idx=torch.tensor([[0, 1], [0, 1], [0, 1], [-1, -1],
+                                        [2, -1]]),
+        selected_topk_idx=torch.tensor([[0, 1], [0, -1], [-1, -1], [-1, -1],
+                                        [-1, -1]]),
+    )
+    handle = TokenDropHandle(handle=object(), state=state)
+
+    stats = handle.get_token_drop_stats()
+
+    assert stats == TokenDropStats(
+        num_tokens=5,
+        num_routable_tokens=4,
+        num_input_assignments=7,
+        num_kept_assignments=3,
+        num_dropped_assignments=4,
+        num_fully_dropped_tokens=2,
+        num_partially_dropped_tokens=1,
+    )
+    assert stats.assignment_drop_rate == pytest.approx(4 / 7)
+    assert stats.fully_dropped_token_rate == pytest.approx(1 / 2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")

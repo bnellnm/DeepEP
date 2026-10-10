@@ -2029,6 +2029,8 @@ static void register_apis(pybind11::module_& m) {
 
     pybind11::class_<TokenDropState, std::shared_ptr<TokenDropState>>(m, "TokenDropState")
         .def_property_readonly("capacity", [](const TokenDropState& state) { return state.capacity; })
+        .def_property_readonly("original_topk_idx", [](const TokenDropState& state) { return state.original_topk_idx; })
+        .def_property_readonly("selected_topk_idx", [](const TokenDropState& state) { return state.selected_topk_idx; })
         .def_property_readonly("packed_tokens_per_rank", [](const TokenDropState& state) { return state.packed_tokens_per_rank; });
 
     pybind11::class_<Buffer>(m, "Buffer")

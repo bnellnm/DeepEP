@@ -411,6 +411,8 @@ std::shared_ptr<TokenDropState> make_token_drop_state(const torch::Tensor& x,
         torch::Tensor(),
         torch::Tensor(),
         std::nullopt,
+        topk_idx,
+        selection.topk_idx,
     });
     state->topk_idx = compact_token_drop_rows(selection.topk_idx, *state);
     state->topk_weights = compact_token_drop_rows(selection.topk_weights, *state);
@@ -438,6 +440,8 @@ std::shared_ptr<TokenDropState> make_low_latency_token_drop_state(const torch::T
         assignments.topk_weights,
         x,
         std::nullopt,
+        topk_idx,
+        assignments.topk_idx,
     });
     state->packed_tokens_per_rank = std::max(1, std::min(expert_capacity, num_max_dispatch_tokens_per_rank));
     return state;

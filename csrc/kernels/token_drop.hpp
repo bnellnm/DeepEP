@@ -17,6 +17,8 @@ struct TokenDropState {
     torch::Tensor topk_weights;
     torch::Tensor x;
     std::optional<torch::Tensor> x_scales;
+    torch::Tensor original_topk_idx;
+    torch::Tensor selected_topk_idx;
     int packed_tokens_per_rank = 0;
 };
 
